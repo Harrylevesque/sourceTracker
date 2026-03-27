@@ -5,6 +5,7 @@ const refreshBtn = document.getElementById('refreshProjects');
 const newProjectInput = document.getElementById('newProject');
 const createProjectBtn = document.getElementById('createProject');
 const saveTabBtn = document.getElementById('saveTab');
+const autoCheckEl = document.getElementById('autoCheck');
 const statusEl = document.getElementById('status');
 
 function setStatus(message, isError = false) {
@@ -19,6 +20,15 @@ async function getStoredProject() {
 
 async function setStoredProject(project) {
   await chrome.storage.sync.set({ project });
+}
+
+async function getAutoCheck() {
+  const stored = await chrome.storage.sync.get(['autoCheck']);
+  return stored.autoCheck !== false; // default true
+}
+
+async function setAutoCheck(v) {
+  await chrome.storage.sync.set({ autoCheck: Boolean(v) });
 }
 
 async function loadProjects(selectedProject) {
@@ -38,6 +48,8 @@ async function loadProjects(selectedProject) {
       : projects[0] || DEFAULT_PROJECT;
     projectSelect.value = toSelect;
     await setStoredProject(toSelect);
+    const auto = await getAutoCheck();
+    autoCheckEl.checked = Boolean(auto);
     setStatus(`Active project: ${toSelect}`);
   } catch (err) {
     setStatus(`Failed to load projects: ${err.message}`, true);
@@ -89,6 +101,11 @@ async function init() {
     const selected = event.target.value;
     await setStoredProject(selected);
     setStatus(`Active project: ${selected}`);
+  });
+
+  autoCheckEl.addEventListener('change', async (e) => {
+    await setAutoCheck(e.target.checked);
+    setStatus(e.target.checked ? 'Auto-check enabled' : 'Auto-check disabled');
   });
 
   refreshBtn.addEventListener('click', async () => {

@@ -27,6 +27,11 @@ async function handleTab(tabId, url) {
   }
 
   try {
+    // Respect user preference for automatic checking
+    const s = await chrome.storage.sync.get(['autoCheck']);
+    const autoCheck = s.autoCheck !== undefined ? Boolean(s.autoCheck) : true;
+    if (!autoCheck) return;
+
     const project = await getStoredProject();
     const key = `${project}|${url}`;
     if (lastHandled.get(tabId) === key) {

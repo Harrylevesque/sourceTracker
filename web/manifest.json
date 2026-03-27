@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "SourceTracker Helper",
   "description": "Capture visited pages into SourceTracker projects.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "permissions": ["tabs", "storage"],
   "host_permissions": [
     "http://127.0.0.1:8000/*",
