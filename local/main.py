@@ -103,6 +103,39 @@ def add_visit_entry(json_path: str, url: str, title: str) -> bool:
     return True
 
 
+def read_citations(json_path: str):
+    """Read citations from given path. Returns list or empty list on errors."""
+    if os.path.exists(json_path):
+        with open(json_path, "r") as file:
+            try:
+                return json.load(file)
+            except json.JSONDecodeError:
+                return []
+    return []
+
+
+def write_citations(json_path: str, data):
+    with open(json_path, "w") as file:
+        json.dump(data, file, indent=2)
+
+
+def add_citation_entry(json_path: str, citation: dict) -> bool:
+    data = read_citations(json_path)
+    # Avoid exact-duplicate entries (same url and selected text and title)
+    is_dup = any(
+        entry.get("url") == citation.get("url") and
+        entry.get("selected_text") == citation.get("selected_text") and
+        entry.get("title") == citation.get("title")
+        for entry in data
+    )
+    if is_dup:
+        return False
+    citation.setdefault("timestamp", int(time.time()))
+    data.append(citation)
+    write_citations(json_path, data)
+    return True
+
+
 def normalize_url(url: str, lenient: bool = True) -> str:
     """Ensure the URL has a scheme. If missing, prepend https://.
 
@@ -163,6 +196,25 @@ class TitleRequest(BaseModel):
 
 class ProjectRequest(BaseModel):
     name: str
+
+
+class CitationRequest(BaseModel):
+    url: Optional[str] = None
+    pubk: Optional[str] = None
+    projectname: Optional[str] = DEFAULT_PROJECT
+    selected_text: Optional[str] = None
+    title: Optional[str] = None
+    author: Optional[str] = None
+    publication_date: Optional[str] = None
+    lenient: Optional[bool] = True
+
+    @root_validator(pre=True)
+    def ensure_url_present(cls, values):
+        if not values.get('url') and values.get('pubk'):
+            values['url'] = values.get('pubk')
+        if not values.get('url'):
+            raise ValueError('Either "url" or "pubk" must be provided in the request body')
+        return values
 
 
 @app.post("/title")
@@ -282,6 +334,81 @@ async def check_visited(
     return {"project": name, "url": normalized, "exists": exists}
 
 
+@app.get("/projects/{project_name}/citations")
+async def list_citations(project_name: str = Path(...)):
+    try:
+        name, _, json_path = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    citations_path = os.path.join(os.path.dirname(json_path), "citations.json")
+    try:
+        citations = read_citations(citations_path)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read storage: {e}")
+
+    return {"project": name, "citations": citations}
+
+
+@app.post("/projects/{project_name}/citations")
+async def add_citation(
+    project_name: str = Path(...),
+    payload: Optional[CitationRequest] = Body(None),
+    url: Optional[str] = Query(None),
+    pubk: Optional[str] = Query(None),
+    selected_text: Optional[str] = Query(None),
+    title: Optional[str] = Query(None),
+    lenient: Optional[bool] = Query(True),
+):
+    try:
+        if payload is None:
+            payload = CitationRequest(url=url, pubk=pubk, projectname=project_name, selected_text=selected_text, title=title, lenient=lenient)
+        else:
+            updates = {k: v for k, v in {
+                "url": url,
+                "pubk": pubk,
+                "projectname": project_name,
+                "selected_text": selected_text,
+                "title": title,
+                "lenient": lenient,
+            }.items() if v is not None}
+            payload = CitationRequest(**{**payload.dict(), **updates})
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    try:
+        normalized = normalize_url(payload.url, lenient=bool(payload.lenient))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # If title missing, try to fetch
+    citation_title = payload.title
+    if not citation_title:
+        try:
+            maybe_title = get_title(normalized)
+            if isinstance(maybe_title, str) and not maybe_title.startswith("Error:"):
+                citation_title = maybe_title
+        except Exception:
+            citation_title = None
+
+    citation = {
+        "url": normalized,
+        "title": citation_title,
+        "selected_text": payload.selected_text,
+        "author": payload.author if hasattr(payload, 'author') else None,
+        "publication_date": payload.publication_date if hasattr(payload, 'publication_date') else None,
+    }
+
+    try:
+        name, directory, _ = project_paths(project_name)
+        citations_path = os.path.join(directory, "citations.json")
+        saved = add_citation_entry(citations_path, citation)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write storage: {e}")
+
+    return {"project": name, "url": normalized, "title": citation_title, "saved": saved}
+
+
 @app.post("/projects/{project_name}/visited")
 async def add_visited(
     project_name: str = Path(...),
@@ -314,8 +441,12 @@ async def add_visited(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    warning = None
     if isinstance(result, str) and result.startswith("Error:"):
-        raise HTTPException(status_code=502, detail=result)
+        # If title fetch failed due to remote/network issues (403, timeouts, etc.),
+        # record the visit anyway with a null title and include the error as a warning
+        warning = result
+        result = None
 
     try:
         name, _, json_path = project_paths(project_name)
@@ -323,7 +454,10 @@ async def add_visited(
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Failed to write storage: {e}")
 
-    return {"project": name, "url": normalized, "title": result, "saved": saved}
+    resp = {"project": name, "url": normalized, "title": result, "saved": saved}
+    if warning:
+        resp["warning"] = warning
+    return resp
 
 
 if __name__ == "__main__":
