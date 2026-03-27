@@ -4,10 +4,14 @@ from bs4 import BeautifulSoup
 import json
 import os
 import re
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Optional, Dict, List
+from urllib.parse import urlparse, urljoin
 import ipaddress
 from urllib3.exceptions import NameResolutionError
+import hashlib
+import difflib
+import base64
+# ...existing code... (removed unused imports)
 
 from fastapi import FastAPI, HTTPException, Body, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
@@ -175,6 +179,151 @@ def normalize_url(url: str, lenient: bool = True) -> str:
             return url
         raise ValueError(f'Invalid host "{host}" in URL: provide a fully-qualified domain, IP address, or "localhost"')
     return url
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+
+def fetch_page_snapshot(url: str) -> Dict:
+    """Fetch the page, extract full text and download/convert images to hex strings.
+
+    Returns a dict with keys: 'text' (str), 'images' (dict mapping image_hash->hexstring),
+    and 'image_map' (list of original src -> image_hash) for ordering/reference.
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        # On failure return minimal snapshot with an error note in text
+        return {"text": f"[ERROR_FETCHING_PAGE] {e}", "images": {}, "image_map": []}
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    # Get visible text
+    page_text = soup.get_text(separator="\n", strip=True)
+
+    images: Dict[str, str] = {}
+    image_map: List[Dict[str, str]] = []
+
+    for img in soup.find_all('img'):
+        src = img.get('src') or img.get('data-src') or img.get('data-original')
+        if not src:
+            continue
+        src = src.strip()
+        try:
+            if src.startswith('data:'):
+                # data:[<mediatype>][;base64],<data>
+                comma = src.find(',')
+                if comma == -1:
+                    continue
+                meta = src[5:comma]
+                data_part = src[comma+1:]
+                if ';base64' in meta:
+                    raw = base64.b64decode(data_part)
+                else:
+                    # percent-encoded
+                    raw = data_part.encode('utf-8')
+            else:
+                full_url = urljoin(url, src)
+                try:
+                    r = requests.get(full_url, headers=headers, timeout=15)
+                    r.raise_for_status()
+                    raw = r.content
+                except Exception:
+                    continue
+            hexstr = raw.hex()
+            img_hash = hashlib.sha256(raw).hexdigest()
+            images.setdefault(img_hash, hexstr)
+            image_map.append({"src": src, "hash": img_hash})
+        except Exception:
+            # skip images that fail to process
+            continue
+
+    return {"text": page_text, "images": images, "image_map": image_map}
+
+
+def record_page_history(project_dir: str, url: str, snapshot: Dict) -> Dict:
+    """Record history for a single URL under project_dir/history/<url_hash>.
+
+    Stores latest full text at latest_text.txt and writes diffs for changes. Images are
+    stored under images/ with filenames <image_hash>.hex. Returns metadata about what was saved.
+    """
+    history_root = os.path.join(project_dir, "history")
+    url_hash = sha256_hex(url)
+    page_dir = os.path.join(history_root, url_hash)
+    images_dir = os.path.join(page_dir, "images")
+    snapshots_dir = os.path.join(page_dir, "snapshots")
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(snapshots_dir, exist_ok=True)
+
+    latest_text_path = os.path.join(page_dir, "latest_text.txt")
+    prev_text = None
+    if os.path.exists(latest_text_path):
+        with open(latest_text_path, 'r', encoding='utf-8') as f:
+            prev_text = f.read()
+
+    current_text = snapshot.get('text', '') or ''
+    ts = int(time.time())
+    meta = {"timestamp": ts, "url": url, "images": [], "changed": False}
+
+    # Handle images: write any new image hex files
+    images = snapshot.get('images', {}) or {}
+    for img_hash, hexstr in images.items():
+        img_path = os.path.join(images_dir, f"{img_hash}.hex")
+        if not os.path.exists(img_path):
+            try:
+                with open(img_path, 'w', encoding='utf-8') as f:
+                    f.write(hexstr)
+            except Exception:
+                continue
+        meta['images'].append(img_hash)
+
+    # Compute diff against previous
+    if prev_text is None:
+        # first snapshot: save full text
+        try:
+            with open(latest_text_path, 'w', encoding='utf-8') as f:
+                f.write(current_text)
+            meta['changed'] = True
+            meta['type'] = 'full'
+        except Exception:
+            pass
+    else:
+        prev_lines = prev_text.splitlines(keepends=True)
+        cur_lines = current_text.splitlines(keepends=True)
+        diff_lines = list(difflib.unified_diff(prev_lines, cur_lines, fromfile='prev', tofile='cur', lineterm=''))
+        if diff_lines:
+            diff_text = '\n'.join(diff_lines) + '\n'
+            diff_filename = os.path.join(snapshots_dir, f"{ts}.diff")
+            try:
+                with open(diff_filename, 'w', encoding='utf-8') as f:
+                    f.write(diff_text)
+                # Update latest_text
+                with open(latest_text_path, 'w', encoding='utf-8') as f:
+                    f.write(current_text)
+                meta['changed'] = True
+                meta['type'] = 'diff'
+                meta['diff_file'] = os.path.relpath(diff_filename, page_dir)
+            except Exception:
+                pass
+        else:
+            # No change
+            meta['changed'] = False
+            meta['type'] = 'no_change'
+
+    # Save snapshot metadata
+    meta_path = os.path.join(snapshots_dir, f"{ts}.meta.json")
+    try:
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
+
+    return meta
 
 
 class TitleRequest(BaseModel):
@@ -409,6 +558,82 @@ async def add_citation(
     return {"project": name, "url": normalized, "title": citation_title, "saved": saved}
 
 
+
+@app.post("/projects/{project_name}/snapshot")
+async def add_snapshot(
+    project_name: str = Path(...),
+    payload: dict = Body(...),
+):
+    """Accept a client-captured snapshot and record history.
+
+    Expected payload keys: url (required), title (optional), text (optional), images (optional list of {src, dataUrl}).
+    dataUrl should be a data:<mediatype>;base64,... string when provided; images without dataUrl will be listed for reference.
+    """
+    try:
+        url = payload.get('url')
+        if not url:
+            raise ValueError('Missing "url" in payload')
+        lenient = payload.get('lenient', True)
+        normalized = normalize_url(url, lenient=bool(lenient))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Ensure project exists and add visit entry if needed
+    try:
+        name, directory, json_path = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    title = payload.get('title')
+    try:
+        # Attempt to add a visited entry (only if not already present)
+        add_visit_entry(json_path, normalized, title)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write storage: {e}")
+
+    # Build snapshot structure expected by record_page_history
+    snapshot: dict = {}
+    snapshot['text'] = payload.get('text') or ''
+    images_in = payload.get('images') or []
+    images_map = {}
+    image_map_list = []
+    for img in images_in:
+        src = img.get('src')
+        dataUrl = img.get('dataUrl') or img.get('data_url') or img.get('data')
+        if dataUrl and isinstance(dataUrl, str) and dataUrl.startswith('data:'):
+            # decode base64 part
+            comma = dataUrl.find(',')
+            if comma != -1:
+                meta = dataUrl[5:comma]
+                data_part = dataUrl[comma+1:]
+                try:
+                    if ';base64' in meta:
+                        raw = base64.b64decode(data_part)
+                    else:
+                        raw = data_part.encode('utf-8')
+                    hexstr = raw.hex()
+                    img_hash = hashlib.sha256(raw).hexdigest()
+                    images_map[img_hash] = hexstr
+                    image_map_list.append({"src": src, "hash": img_hash})
+                except Exception:
+                    # skip malformed image data
+                    image_map_list.append({"src": src, "hash": None})
+            else:
+                image_map_list.append({"src": src, "hash": None})
+        else:
+            image_map_list.append({"src": src, "hash": None})
+
+    snapshot['images'] = images_map
+    snapshot['image_map'] = image_map_list
+
+    try:
+        history_meta = record_page_history(directory, normalized, snapshot)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to record history: {e}")
+
+    return {"project": name, "url": normalized, "history": history_meta}
+
+
 @app.post("/projects/{project_name}/visited")
 async def add_visited(
     project_name: str = Path(...),
@@ -449,12 +674,19 @@ async def add_visited(
         result = None
 
     try:
-        name, _, json_path = project_paths(project_name)
+        name, directory, json_path = project_paths(project_name)
         saved = add_visit_entry(json_path, normalized, result)
+        # Fetch full page snapshot (text + images) and record history diffs
+        try:
+            snapshot = fetch_page_snapshot(normalized)
+            history_meta = record_page_history(directory, normalized, snapshot)
+        except Exception as e:
+            # If history recording fails, include a warning but don't block the visit save
+            history_meta = {"error": str(e)}
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Failed to write storage: {e}")
 
-    resp = {"project": name, "url": normalized, "title": result, "saved": saved}
+    resp = {"project": name, "url": normalized, "title": result, "saved": saved, "history": history_meta}
     if warning:
         resp["warning"] = warning
     return resp

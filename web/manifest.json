@@ -2,11 +2,12 @@
   "manifest_version": 3,
   "name": "SourceTracker Helper",
   "description": "Capture visited pages into SourceTracker projects.",
-  "version": "0.1.1",
-  "permissions": ["tabs", "storage", "contextMenus"],
+  "version": "0.1.3",
+  "permissions": ["tabs", "storage", "contextMenus", "scripting", "activeTab"],
   "host_permissions": [
     "http://127.0.0.1:8000/*",
-    "http://localhost:8000/*"
+    "http://localhost:8000/*",
+    "<all_urls>"
   ],
   "action": {
     "default_title": "SourceTracker",
@@ -16,4 +17,18 @@
     "service_worker": "background.js",
     "type": "module"
   }
+  ,
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["contentScript.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["contentScript.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

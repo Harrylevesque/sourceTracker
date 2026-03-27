@@ -1,4 +1,4 @@
-import { API_BASE, DEFAULT_PROJECT, apiRequest } from './config.js';
+import { DEFAULT_PROJECT, apiRequest } from './config.js';
 
 const lastHandled = new Map(); // tabId -> `${project}|${url}`
 
@@ -59,6 +59,20 @@ async function checkVisited(project, url) {
 async function recordVisit(project, url) {
   const encodedProject = encodeURIComponent(project);
   try {
+    // First try to obtain a client-side snapshot (text + images) and POST to /snapshot
+    try {
+      const snapshot = await requestSnapshotFromTab(url);
+      if (snapshot) {
+        return await apiRequest(`/projects/${encodedProject}/snapshot`, {
+          method: 'POST',
+          body: JSON.stringify(snapshot),
+        });
+      }
+    } catch (err) {
+      // fall back to server-side fetch if content script snapshot fails
+      console.warn('Snapshot via content script failed, falling back to simple visit:', err?.message || err);
+    }
+
     return await apiRequest(`/projects/${encodedProject}/visited`, {
       method: 'POST',
       body: JSON.stringify({ url, lenient: true }),
@@ -67,6 +81,45 @@ async function recordVisit(project, url) {
     // The server may fail to fetch a title for some sites (403, timeouts); don't bubble that
     // into an uncaught error here — just log and continue.
     console.warn('recordVisit API error (ignored):', err?.message || err);
+    return null;
+  }
+}
+
+async function requestSnapshotFromTab(url) {
+  try {
+    // Find a tab with the URL and ask it to run the content script
+    const tabs = await chrome.tabs.query({ url: url });
+    const tab = tabs && tabs[0];
+    if (!tab) return null;
+
+    return new Promise((resolve, reject) => {
+      const onMessage = (msg, sender) => {
+        if (msg && msg.type === 'PAGE_SNAPSHOT' && sender.tab && sender.tab.id === tab.id) {
+          chrome.runtime.onMessage.removeListener(onMessage);
+          resolve(msg.payload);
+        }
+      };
+      chrome.runtime.onMessage.addListener(onMessage);
+
+      try {
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['contentScript.js'],
+        }).catch((e) => {
+          chrome.runtime.onMessage.removeListener(onMessage);
+          reject(e);
+        });
+      } catch (e) {
+        chrome.runtime.onMessage.removeListener(onMessage);
+        reject(e);
+      }
+      // Timeout in 8s
+      setTimeout(() => {
+        chrome.runtime.onMessage.removeListener(onMessage);
+        resolve(null);
+      }, 8000);
+    });
+  } catch (err) {
     return null;
   }
 }

@@ -83,6 +83,21 @@ async function saveCurrentTab() {
       return;
     }
     const project = await getStoredProject();
+    // Try to request a snapshot from the content script and POST it to /snapshot
+    try {
+      const snapshot = await requestSnapshotFromActiveTab();
+      if (snapshot) {
+        const result = await apiRequest(`/projects/${encodeURIComponent(project)}/snapshot`, {
+          method: 'POST',
+          body: JSON.stringify(snapshot),
+        });
+        setStatus(result.history && result.history.changed ? 'Saved snapshot.' : 'Saved (no change).');
+        return;
+      }
+    } catch (err) {
+      console.warn('Snapshot via content script failed, falling back to simple save:', err?.message || err);
+    }
+
     const result = await apiRequest(`/projects/${encodeURIComponent(project)}/visited`, {
       method: 'POST',
       body: JSON.stringify({ url: tab.url, lenient: true }),
@@ -91,6 +106,34 @@ async function saveCurrentTab() {
   } catch (err) {
     setStatus(`Save failed: ${err.message}`, true);
   }
+}
+
+async function requestSnapshotFromActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) return null;
+  return new Promise((resolve, reject) => {
+    const onMessage = (msg, sender) => {
+      if (msg && msg.type === 'PAGE_SNAPSHOT' && sender.tab && sender.tab.id === tab.id) {
+        chrome.runtime.onMessage.removeListener(onMessage);
+        resolve(msg.payload);
+      }
+    };
+    chrome.runtime.onMessage.addListener(onMessage);
+    try {
+      chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['contentScript.js'] })
+        .catch((e) => {
+          chrome.runtime.onMessage.removeListener(onMessage);
+          reject(e);
+        });
+    } catch (e) {
+      chrome.runtime.onMessage.removeListener(onMessage);
+      reject(e);
+    }
+    setTimeout(() => {
+      chrome.runtime.onMessage.removeListener(onMessage);
+      resolve(null);
+    }, 8000);
+  });
 }
 
 async function init() {
