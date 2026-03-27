@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SourceTracker</title>
+  <style>
+    body { font-family: Arial, sans-serif; min-width: 280px; margin: 12px; }
+    h1 { font-size: 16px; margin: 0 0 8px; }
+    label { display: block; margin: 8px 0 4px; font-weight: bold; }
+    select, input { width: 100%; box-sizing: border-box; padding: 6px; }
+    button { margin-top: 8px; width: 100%; padding: 8px; cursor: pointer; }
+    .row { margin-top: 8px; }
+    .status { margin-top: 8px; font-size: 12px; min-height: 16px; }
+  </style>
+</head>
+<body>
+  <h1>SourceTracker</h1>
+  <label for="projectSelect">Active project</label>
+  <select id="projectSelect"></select>
+  <button id="refreshProjects">Refresh projects</button>
+
+  <div class="row">
+    <label for="newProject">Create project</label>
+    <input id="newProject" type="text" placeholder="my-project" />
+    <button id="createProject">Create</button>
+  </div>
+
+  <div class="row">
+    <button id="saveTab">Save current tab now</button>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

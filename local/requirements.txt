@@ -1,3 +1,4 @@
-typer
-BeautifulSoup
+fastapi
+uvicorn
 requests
+beautifulsoup4
