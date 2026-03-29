@@ -26,6 +26,7 @@
   }
 
   const text = getVisibleText();
+  const html = document.documentElement ? document.documentElement.outerHTML : document.documentElement.innerHTML;
   const imgs = Array.from(document.images || []);
   const images = [];
   for (const img of imgs) {
@@ -34,6 +35,7 @@
   }
 
   // Return snapshot to the caller
-  chrome.runtime.sendMessage({ type: 'PAGE_SNAPSHOT', payload: { url: location.href, title: document.title, text, images } });
+  chrome.runtime.sendMessage({ type: 'PAGE_SNAPSHOT', payload: { url: location.href, title: document.title, text, html, images } });
 })();
+
 

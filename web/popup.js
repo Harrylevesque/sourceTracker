@@ -5,6 +5,7 @@ const refreshBtn = document.getElementById('refreshProjects');
 const newProjectInput = document.getElementById('newProject');
 const createProjectBtn = document.getElementById('createProject');
 const saveTabBtn = document.getElementById('saveTab');
+const viewSnapshotBtn = document.getElementById('viewSnapshot');
 const autoCheckEl = document.getElementById('autoCheck');
 const statusEl = document.getElementById('status');
 
@@ -158,8 +159,60 @@ async function init() {
 
   createProjectBtn.addEventListener('click', createProject);
   saveTabBtn.addEventListener('click', saveCurrentTab);
+  viewSnapshotBtn.addEventListener('click', viewSnapshot);
 
   setStatus(`Using API at ${API_BASE}`);
 }
 
 init();
+
+async function viewSnapshot() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.url || !tab.url.startsWith('http')) {
+      setStatus('Active tab is not a webpage.', true);
+      return;
+    }
+    const project = await getStoredProject();
+    const apiPath = `/projects/${encodeURIComponent(project)}/history/by_url?url=${encodeURIComponent(tab.url)}`;
+    let info = null;
+    try {
+      info = await apiRequest(apiPath);
+    } catch (err) {
+      // ignore and try to save first
+      info = null;
+    }
+
+    if (info && info.exists) {
+      const openUrl = `${API_BASE}${info.view_url}`;
+      chrome.tabs.create({ url: openUrl });
+      return;
+    }
+
+    // Not found: try saving then poll for a short time
+    setStatus('Snapshot not found; saving and waiting...', false);
+    await saveCurrentTab();
+
+    const maxAttempts = 6;
+    const delayMs = 2000;
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        info = await apiRequest(apiPath);
+        if (info && info.exists) {
+          const openUrl = `${API_BASE}${info.view_url}`;
+          chrome.tabs.create({ url: openUrl });
+          setStatus('Opened snapshot view.');
+          return;
+        }
+      } catch (err) {
+        // ignore and retry
+      }
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+
+    setStatus('Snapshot not available yet; try again in a moment.', true);
+  } catch (err) {
+    setStatus(`Failed to open snapshot: ${err.message}`, true);
+  }
+}
+

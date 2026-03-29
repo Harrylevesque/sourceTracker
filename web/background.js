@@ -81,9 +81,9 @@ async function recordVisit(project, url) {
     // The server may fail to fetch a title for some sites (403, timeouts); don't bubble that
     // into an uncaught error here — just log and continue.
     console.warn('recordVisit API error (ignored):', err?.message || err);
-    return null;
-  }
-}
+
+async function handleTab(tabId, url) {
+  if (!url || !url.startsWith('http')) {
 
 async function requestSnapshotFromTab(url) {
   try {
@@ -123,9 +123,6 @@ async function requestSnapshotFromTab(url) {
     return null;
   }
 }
-
-async function handleTab(tabId, url) {
-  if (!url || !url.startsWith('http')) {
     return;
   }
 

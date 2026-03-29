@@ -1,17 +1,22 @@
+    resp = {"project": name, "url": normalized, "title": result, "saved": saved}
+        name, _, json_path = project_paths(project_name)
 import time
 import requests
 from bs4 import BeautifulSoup
 import json
-import os
-import re
 from typing import Optional, Dict, List
 from urllib.parse import urlparse, urljoin
-import ipaddress
-from urllib3.exceptions import NameResolutionError
+from typing import Optional
+from urllib.parse import urlparse
 import hashlib
 import difflib
 import base64
+import html
 # ...existing code... (removed unused imports)
+from urllib.parse import urlparse
+import ipaddress
+from fastapi.responses import HTMLResponse, Response
+from urllib3.exceptions import NameResolutionError
 
 from fastapi import FastAPI, HTTPException, Body, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,6 +85,239 @@ def project_paths(name: Optional[str]):
     directory = os.path.normpath(os.path.join(STORAGE_ROOT, sanitized))
     file_path = os.path.join(directory, "visited.json")
     os.makedirs(directory, exist_ok=True)
+def history_root_for_project(name: str) -> str:
+    _, directory, _ = project_paths(name)
+    return os.path.join(directory, 'history')
+
+
+@app.get("/projects/{project_name}/history")
+async def list_history(project_name: str = Path(...)):
+    try:
+        name, directory, _ = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    hist_root = os.path.join(directory, 'history')
+    if not os.path.exists(hist_root):
+        return {"project": name, "history": []}
+
+    entries = []
+    for entry in os.listdir(hist_root):
+        entry_path = os.path.join(hist_root, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        # try to read latest meta if any
+        snapshots_dir = os.path.join(entry_path, 'snapshots')
+        latest_meta = None
+        if os.path.exists(snapshots_dir):
+            metas = [f for f in os.listdir(snapshots_dir) if f.endswith('.meta.json')]
+            if metas:
+                metas_sorted = sorted(metas)
+                try:
+                    with open(os.path.join(snapshots_dir, metas_sorted[-1]), 'r', encoding='utf-8') as f:
+                        latest_meta = json.load(f)
+                except Exception:
+                    latest_meta = None
+        entries.append({"url_hash": entry, "meta": latest_meta})
+
+    return {"project": name, "history": entries}
+
+
+@app.get("/projects/{project_name}/history/{url_hash}/raw")
+async def get_raw_html(project_name: str = Path(...), url_hash: str = Path(...)):
+    try:
+        name, directory, _ = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    page_dir = os.path.join(directory, 'history', url_hash)
+    latest_html_path = os.path.join(page_dir, 'latest.html')
+    if os.path.exists(latest_html_path):
+        with open(latest_html_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return HTMLResponse(content=content)
+
+    # Fallback: if we have an older latest_text.txt, render a simple HTML wrapper and
+    # include any stored images so they are visible in the preview.
+    latest_text_path = os.path.join(page_dir, 'latest_text.txt')
+    images_dir = os.path.join(page_dir, 'images')
+    if os.path.exists(latest_text_path):
+        try:
+            with open(latest_text_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except Exception:
+            text = ''
+
+        imgs_html = ''
+        if os.path.isdir(images_dir):
+            try:
+                for fname in sorted(os.listdir(images_dir)):
+                    if not fname.endswith('.hex'):
+                        continue
+                    image_hash = fname[:-4]
+                    src = f"/projects/{project_name}/history/{url_hash}/images/{image_hash}"
+                    imgs_html += f'<div style="margin:8px 0"><img src="{src}" style="max-width:100%;height:auto"/></div>'
+            except Exception:
+                imgs_html = ''
+
+        escaped = html.escape(text)
+        wrapper = f"""
+        <!doctype html>
+        <html>
+          <head><meta charset='utf-8'><title>Snapshot (text-only) - {project_name} / {url_hash}</title></head>
+          <body>
+            <div style='white-space:pre-wrap;font-family:system-ui,Arial,sans-serif;'>{escaped}</div>
+            <hr/>
+            <div>{imgs_html}</div>
+          </body>
+        </html>
+        """
+        return HTMLResponse(content=wrapper)
+
+    raise HTTPException(status_code=404, detail='Latest HTML snapshot not found')
+
+
+@app.get("/projects/{project_name}/history/{url_hash}/view")
+async def view_html_wrapper(project_name: str = Path(...), url_hash: str = Path(...)):
+    try:
+        name, directory, _ = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    raw_url = f"/projects/{encodeURIComponent(project_name)}/history/{url_hash}/raw"
+    # But encodeURIComponent isn't available here; build a safe path
+    raw_url = f"/projects/{project_name}/history/{url_hash}/raw"
+    wrapper = f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset='utf-8'/>
+        <title>Snapshot view - {project_name} / {url_hash}</title>
+        <style>html,body,iframe{{height:100%;margin:0;padding:0;border:0}}iframe{{width:100%;border:0}}</style>
+      </head>
+      <body>
+        <iframe src="{raw_url}" sandbox="allow-same-origin allow-scripts allow-forms"></iframe>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=wrapper)
+
+
+def encodeURIComponent(s: str) -> str:
+    # minimal replacement for safe path pieces
+    return requests.utils.requote_uri(s)
+
+
+@app.get("/projects/{project_name}/history/{url_hash}/images/{image_hash}")
+async def serve_image(project_name: str = Path(...), url_hash: str = Path(...), image_hash: str = Path(...)):
+    try:
+        name, directory, _ = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    img_path = os.path.join(directory, 'history', url_hash, 'images', f"{image_hash}.hex")
+    if not os.path.exists(img_path):
+        raise HTTPException(status_code=404, detail='Image not found')
+
+    try:
+        with open(img_path, 'r', encoding='utf-8') as f:
+            hexstr = f.read().strip()
+        data = bytes.fromhex(hexstr)
+    except Exception:
+        raise HTTPException(status_code=500, detail='Failed to read image')
+
+    # Try to detect common image types by magic bytes (avoid imghdr dependency)
+    def detect_mime(b: bytes) -> str:
+        if b.startswith(b"\x89PNG\r\n\x1a\n"):
+            return 'image/png'
+        if b.startswith(b"\xff\xd8\xff"):
+            return 'image/jpeg'
+        if b.startswith(b'GIF87a') or b.startswith(b'GIF89a'):
+            return 'image/gif'
+        if b.startswith(b'BM'):
+            return 'image/bmp'
+        if len(b) >= 12 and b[0:4] == b'RIFF' and b[8:12] == b'WEBP':
+            return 'image/webp'
+        return 'application/octet-stream'
+
+    content_type = detect_mime(data)
+    return Response(content=data, media_type=content_type)
+
+
+@app.get("/projects/{project_name}/history/{url_hash}/snapshots")
+async def list_snapshots(project_name: str = Path(...), url_hash: str = Path(...)):
+    try:
+        name, directory, _ = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    snapshots_dir = os.path.join(directory, 'history', url_hash, 'snapshots')
+    if not os.path.exists(snapshots_dir):
+        return {"project": name, "url_hash": url_hash, "snapshots": []}
+
+    files = sorted(os.listdir(snapshots_dir))
+    return {"project": name, "url_hash": url_hash, "snapshots": files}
+
+
+@app.get("/projects/{project_name}/history/{url_hash}/snapshots/{fname}")
+async def get_snapshot_file(project_name: str = Path(...), url_hash: str = Path(...), fname: str = Path(...)):
+    try:
+        name, directory, _ = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    snapshots_dir = os.path.join(directory, 'history', url_hash, 'snapshots')
+    file_path = os.path.join(snapshots_dir, fname)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail='Snapshot file not found')
+
+    # serve diffs as text/plain and meta.json as application/json
+    if fname.endswith('.diff'):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return Response(content=content, media_type='text/plain')
+    elif fname.endswith('.json') or fname.endswith('.meta.json'):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = json.load(f)
+        return content
+    else:
+        # generic file
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        return Response(content=data, media_type='application/octet-stream')
+
+
+
+@app.get("/projects/{project_name}/history/by_url")
+async def history_by_url(
+    project_name: str = Path(...),
+    url: str = Query(...),
+    lenient: Optional[bool] = Query(True),
+):
+    try:
+        name, directory, _ = project_paths(project_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    try:
+        normalized = normalize_url(url, lenient=bool(lenient))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    url_hash = sha256_hex(normalized)
+    page_dir = os.path.join(directory, 'history', url_hash)
+    exists = os.path.exists(page_dir)
+    result = {
+        'project': name,
+        'url': normalized,
+        'url_hash': url_hash,
+        'exists': exists,
+        'view_url': f"/projects/{name}/history/{url_hash}/view",
+        'raw_url': f"/projects/{name}/history/{url_hash}/raw",
+    }
+    return result
+
+
     return sanitized, directory, file_path
 
 
@@ -178,9 +416,6 @@ def normalize_url(url: str, lenient: bool = True) -> str:
             # accept single-label hostnames in lenient mode
             return url
         raise ValueError(f'Invalid host "{host}" in URL: provide a fully-qualified domain, IP address, or "localhost"')
-    return url
-
-
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
@@ -202,8 +437,10 @@ def fetch_page_snapshot(url: str) -> Dict:
         # On failure return minimal snapshot with an error note in text
         return {"text": f"[ERROR_FETCHING_PAGE] {e}", "images": {}, "image_map": []}
 
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    # Get visible text
+    # Keep full HTML so styling and structure are preserved
+    page_html = resp.text
+    # Also extract visible text if needed elsewhere
+    soup = BeautifulSoup(page_html, 'html.parser')
     page_text = soup.get_text(separator="\n", strip=True)
 
     images: Dict[str, str] = {}
@@ -243,7 +480,7 @@ def fetch_page_snapshot(url: str) -> Dict:
             # skip images that fail to process
             continue
 
-    return {"text": page_text, "images": images, "image_map": image_map}
+    return {"html": page_html, "text": page_text, "images": images, "image_map": image_map}
 
 
 def record_page_history(project_dir: str, url: str, snapshot: Dict) -> Dict:
@@ -260,13 +497,13 @@ def record_page_history(project_dir: str, url: str, snapshot: Dict) -> Dict:
     os.makedirs(images_dir, exist_ok=True)
     os.makedirs(snapshots_dir, exist_ok=True)
 
-    latest_text_path = os.path.join(page_dir, "latest_text.txt")
-    prev_text = None
-    if os.path.exists(latest_text_path):
-        with open(latest_text_path, 'r', encoding='utf-8') as f:
-            prev_text = f.read()
+    latest_html_path = os.path.join(page_dir, "latest.html")
+    prev_html = None
+    if os.path.exists(latest_html_path):
+        with open(latest_html_path, 'r', encoding='utf-8') as f:
+            prev_html = f.read()
 
-    current_text = snapshot.get('text', '') or ''
+    current_html = snapshot.get('html') or snapshot.get('text') or ''
     ts = int(time.time())
     meta = {"timestamp": ts, "url": url, "images": [], "changed": False}
 
@@ -283,28 +520,69 @@ def record_page_history(project_dir: str, url: str, snapshot: Dict) -> Dict:
         meta['images'].append(img_hash)
 
     # Compute diff against previous
-    if prev_text is None:
-        # first snapshot: save full text
+    def _rewrite_images_in_html(html_content: str, image_map: List[Dict[str, str]]) -> str:
         try:
-            with open(latest_text_path, 'w', encoding='utf-8') as f:
-                f.write(current_text)
+            soup_local = BeautifulSoup(html_content, 'html.parser')
+            # build lookup from original src to hash for quick matching
+            lookup = {}
+            for im in image_map:
+                src = im.get('src')
+                h = im.get('hash')
+                if src and h:
+                    lookup[src] = h
+
+            for img_tag in soup_local.find_all('img'):
+                src = img_tag.get('src') or img_tag.get('data-src') or img_tag.get('data-original')
+                if not src:
+                    continue
+                # direct match
+                if src in lookup:
+                    img_tag['src'] = f"images/{lookup[src]}"
+                    # remove srcset to avoid browser choosing non-local variants
+                    if 'srcset' in img_tag.attrs:
+                        del img_tag.attrs['srcset']
+                else:
+                    # also try matching by the path portion in case of absolute vs relative differences
+                    for orig, h in lookup.items():
+                        if orig and orig.endswith(src):
+                            img_tag['src'] = f"images/{h}"
+                            if 'srcset' in img_tag.attrs:
+                                del img_tag.attrs['srcset']
+                            break
+
+            return str(soup_local)
+        except Exception:
+            return html_content
+
+    if prev_html is None:
+        # first snapshot: save full html (rewrite image srcs to local relative endpoints)
+        try:
+            rewritten = _rewrite_images_in_html(current_html, snapshot.get('image_map', []) or [])
+            with open(latest_html_path, 'w', encoding='utf-8') as f:
+                f.write(rewritten)
             meta['changed'] = True
             meta['type'] = 'full'
         except Exception:
             pass
     else:
-        prev_lines = prev_text.splitlines(keepends=True)
-        cur_lines = current_text.splitlines(keepends=True)
-        diff_lines = list(difflib.unified_diff(prev_lines, cur_lines, fromfile='prev', tofile='cur', lineterm=''))
+        prev_lines = prev_html.splitlines(keepends=True)
+        cur_lines = current_html.splitlines(keepends=True)
+        diff_lines = list(difflib.unified_diff(prev_lines, cur_lines, fromfile='prev.html', tofile='cur.html', lineterm=''))
         if diff_lines:
             diff_text = '\n'.join(diff_lines) + '\n'
             diff_filename = os.path.join(snapshots_dir, f"{ts}.diff")
             try:
                 with open(diff_filename, 'w', encoding='utf-8') as f:
                     f.write(diff_text)
-                # Update latest_text
-                with open(latest_text_path, 'w', encoding='utf-8') as f:
-                    f.write(current_text)
+                # Update latest_html (rewrite image srcs)
+                try:
+                    rewritten = _rewrite_images_in_html(current_html, snapshot.get('image_map', []) or [])
+                    with open(latest_html_path, 'w', encoding='utf-8') as f:
+                        f.write(rewritten)
+                except Exception:
+                    # fallback to raw html
+                    with open(latest_html_path, 'w', encoding='utf-8') as f:
+                        f.write(current_html)
                 meta['changed'] = True
                 meta['type'] = 'diff'
                 meta['diff_file'] = os.path.relpath(diff_filename, page_dir)
@@ -324,6 +602,9 @@ def record_page_history(project_dir: str, url: str, snapshot: Dict) -> Dict:
         pass
 
     return meta
+
+
+    return url
 
 
 class TitleRequest(BaseModel):
@@ -555,9 +836,6 @@ async def add_citation(
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Failed to write storage: {e}")
 
-    return {"project": name, "url": normalized, "title": citation_title, "saved": saved}
-
-
 
 @app.post("/projects/{project_name}/snapshot")
 async def add_snapshot(
@@ -593,6 +871,8 @@ async def add_snapshot(
 
     # Build snapshot structure expected by record_page_history
     snapshot: dict = {}
+    # Prefer full HTML when provided by client
+    snapshot['html'] = payload.get('html') or payload.get('html_content') or payload.get('text') or ''
     snapshot['text'] = payload.get('text') or ''
     images_in = payload.get('images') or []
     images_map = {}
@@ -634,6 +914,9 @@ async def add_snapshot(
     return {"project": name, "url": normalized, "history": history_meta}
 
 
+    return {"project": name, "url": normalized, "title": citation_title, "saved": saved}
+
+
 @app.post("/projects/{project_name}/visited")
 async def add_visited(
     project_name: str = Path(...),
@@ -671,11 +954,8 @@ async def add_visited(
         # If title fetch failed due to remote/network issues (403, timeouts, etc.),
         # record the visit anyway with a null title and include the error as a warning
         warning = result
-        result = None
-
-    try:
         name, directory, json_path = project_paths(project_name)
-        saved = add_visit_entry(json_path, normalized, result)
+
         # Fetch full page snapshot (text + images) and record history diffs
         try:
             snapshot = fetch_page_snapshot(normalized)
@@ -683,10 +963,13 @@ async def add_visited(
         except Exception as e:
             # If history recording fails, include a warning but don't block the visit save
             history_meta = {"error": str(e)}
-    except OSError as e:
+    try:
+        name, _, json_path = project_paths(project_name)
+        saved = add_visit_entry(json_path, normalized, result)
+    resp = {"project": name, "url": normalized, "title": result, "saved": saved, "history": history_meta}
         raise HTTPException(status_code=500, detail=f"Failed to write storage: {e}")
 
-    resp = {"project": name, "url": normalized, "title": result, "saved": saved, "history": history_meta}
+    resp = {"project": name, "url": normalized, "title": result, "saved": saved}
     if warning:
         resp["warning"] = warning
     return resp
